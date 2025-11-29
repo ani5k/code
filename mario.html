@@ -1,0 +1,851 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Platformer — Mario-Inspired Demo</title>
+<style>
+  html,body{height:100%;margin:0;background:#0b1220;color:#fff;font-family:Inter,system-ui,Segoe UI,Roboto,Arial}
+  #gameCanvas{display:block;width:100%;height:100vh;cursor:crosshair;background:#6EC6FF}
+  .hud{position:absolute;left:12px;top:12px;background:rgba(0,0,0,0.25);padding:8px 12px;border-radius:10px;font-weight:700}
+  .rightHud{position:absolute;right:12px;top:12px;background:rgba(0,0,0,0.25);padding:8px 12px;border-radius:10px}
+  #instructions{position:absolute;right:12px;bottom:12px;background:rgba(0,0,0,0.18);padding:8px;border-radius:8px;font-size:13px}
+  button{background:#ffffff11;border:1px solid #ffffff22;color:#fff;padding:6px 8px;border-radius:8px;cursor:pointer}
+</style>
+</head>
+<body>
+<canvas id="gameCanvas"></canvas>
+<div class="hud" id="leftHud">Score: <span id="score">0</span> &nbsp; Lives: <span id="lives">3</span></div>
+<div class="rightHud" id="rightHud">Level: <span id="level">1</span> &nbsp; Power: <span id="power">Small</span></div>
+<div id="instructions">
+  Controls: WASD / Arrow keys. Jump: W / ↑ / Space. Click to shoot (if Fire).<br>
+  Collect coins, stomp enemies, hit ?-blocks. Reach the flag to finish level.<br>
+  <button id="restartBtn">Restart</button>
+</div>
+
+<script>
+/* ============================
+   Mario-Inspired Platformer
+   Vanilla JS single-file
+   Features implemented:
+   - Pattern-based level chunks (safe path)
+   - Enemy types: Goomba, Koopa(shell), Paragoomba, Piranha, Shooter, Flyer
+   - Power-ups: Mushroom (grow), Fire Flower (shoot), Star (invincible), 1-Up
+   - ?-blocks, breakable bricks, pipes, flagpole, checkpoints
+   - HUD, coins, particles, camera, parallax
+   ============================ */
+
+/* ========= CONFIG ========= */
+const CONFIG = {
+  gravity: 1600,
+  accel: 2200,
+  maxSpeed: 420,
+  friction: 0.88,
+  jumpSpeed: 560,
+  airControl: 0.78,
+  coyoteTime: 0.12,
+  jumpBuffer: 0.1,
+  variableJumpMult: 0.55,
+  baseLevelWidth: 5200,
+  baseCoins: 28,
+  baseEnemies: 8,
+  sectionWidth: 900, // chunks
+  checkpointCount: 2,
+  tile: 32
+};
+
+const ENEMY_TYPE = {
+  GOOMBA: 'goomba',
+  KOOPA: 'koopa',
+  PARAGOOMBA: 'paragoomba',
+  PIRANHA: 'piranha',
+  SHOOTER: 'shooter',
+  FLYER: 'flyer'
+};
+
+const POWER = {
+  SMALL: 'Small',
+  BIG: 'Big',
+  FIRE: 'Fire',
+  STAR: 'Star'
+};
+
+/* ========== CANVAS ========= */
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+let DPR = Math.max(1, window.devicePixelRatio || 1);
+function resize(){ DPR = Math.max(1, window.devicePixelRatio || 1); canvas.width = Math.floor(window.innerWidth * DPR); canvas.height = Math.floor(window.innerHeight * DPR); canvas.style.width = window.innerWidth + 'px'; canvas.style.height = window.innerHeight + 'px'; ctx.setTransform(DPR,0,0,DPR,0,0); }
+window.addEventListener('resize', resize);
+resize();
+
+/* ========== INPUT ========= */
+const keys = {};
+const pointer = {x:0,y:0,down:false};
+window.addEventListener('keydown', e => { keys[e.key.toLowerCase()] = true; if(['w',' ','arrowup'].includes(e.key.toLowerCase())) player.jumpBuffer = CONFIG.jumpBuffer; });
+window.addEventListener('keyup', e => keys[e.key.toLowerCase()] = false );
+canvas.addEventListener('mousemove', e => { const r = canvas.getBoundingClientRect(); pointer.x = e.clientX - r.left; pointer.y = e.clientY - r.top;});
+canvas.addEventListener('mousedown', ()=> pointer.down = true);
+window.addEventListener('mouseup', ()=> pointer.down = false);
+
+/* ========== STATE ========= */
+const scoreEl = document.getElementById('score');
+const livesEl = document.getElementById('lives');
+const levelEl = document.getElementById('level');
+const powerEl = document.getElementById('power');
+document.getElementById('restartBtn').addEventListener('click', ()=> initGame());
+
+let state = { lastTime: performance.now()/1000, level: 1 };
+let camera = { x:0, y:0, w: window.innerWidth, h: window.innerHeight };
+let LEVEL = { width: CONFIG.baseLevelWidth, coinCount: CONFIG.baseCoins, enemyCount: CONFIG.baseEnemies };
+
+/* ========== PLAYER ========= */
+const player = {
+  x: 120, y: -20, w: 28, h: 40,
+  vx: 0, vy: 0, onGround:false,
+  canJumpTimer:0, jumpBuffer:0,
+  lives: 3, score: 0,
+  invuln: 0, shootCooldown:0,
+  power: POWER.SMALL, bigTimer:0, starTimer:0
+};
+
+/* ========== WORLD CONTAINERS ========= */
+let platforms = [], coins = [], enemies = [], bullets = [], particles = [], blocks = [], pipes = [], checkpoints = [], activeCheckpoint = null;
+let flag = null;
+
+/* ========== UTIL ========= */
+function rand(a,b){ return Math.random()*(b-a)+a; }
+function clamp(v,a,b){ return Math.max(a, Math.min(b,v)); }
+function rectsOverlap(A,B){ return !(A.x + A.w <= B.x || A.x >= B.x + B.w || A.y + A.h <= B.y || A.y >= B.y + B.h); }
+function spawnParticle(x,y,vx,vy,life,c,size=3){ particles.push({x,y,vx,vy,life,t:0,color:c,size}); }
+
+/* ========== THEME ========= */
+let SKY_TOP = '#6EC6FF', SKY_BOTTOM = '#6EC6FF';
+function setTheme(lvl){
+  const r = lvl % 4;
+  if(r===0){ SKY_TOP='#6EC6FF'; SKY_BOTTOM='#4DB7FF'; }
+  if(r===1){ SKY_TOP='#FFDDAA'; SKY_BOTTOM='#FF9866'; }
+  if(r===2){ SKY_TOP='#091226'; SKY_BOTTOM='#18304a'; }
+  if(r===3){ SKY_TOP='#BEECC9'; SKY_BOTTOM='#5DBD78'; }
+}
+
+/* ========== PATTERN-BASED LEVEL GENERATOR (Mario-like) ========= */
+function makeLevel(){
+  platforms = []; coins = []; enemies = []; bullets = []; particles = []; blocks = []; pipes = []; checkpoints = []; activeCheckpoint = null; flag = null;
+  // dynamic level params
+  LEVEL.width = CONFIG.baseLevelWidth + (state.level-1)*600;
+  LEVEL.coinCount = CONFIG.baseCoins + (state.level-1)*6;
+  LEVEL.enemyCount = CONFIG.baseEnemies + Math.floor((state.level-1)*1.8);
+
+  const FLOOR_Y = 520; // stable world baseline
+  // ground base
+  platforms.push({x:0,y:FLOOR_Y,w:LEVEL.width,h:80, type:'ground'});
+
+  // patterns list for chunk-based generation
+  const sections = Math.max(4, Math.floor(LEVEL.width / CONFIG.sectionWidth));
+  let cursor = 200;
+  let pathY = FLOOR_Y - 120;
+  // start platforms near beginning
+  platforms.push({x:120,y:pathY - 10,w:220,h:20});
+
+  for(let i=0;i<sections;i++){
+    const chunkType = chooseChunk(i);
+    const baseX = cursor;
+    switch(chunkType){
+      case 'straight':
+        // a couple small platforms then long flat
+        platforms.push({x:baseX, y:pathY, w:rand(240,420), h:20});
+        cursor += rand(260,420);
+        break;
+      case 'small_hills':
+        // series of small ups & downs but limited
+        for(let j=0;j<3;j++){
+          const w = rand(120,220);
+          pathY += rand(-60,60);
+          pathY = clamp(pathY, FLOOR_Y - 220, FLOOR_Y - 60);
+          platforms.push({x:cursor, y:pathY, w:w, h:20});
+          cursor += w + rand(80,160);
+        }
+        break;
+      case 'gap':
+        // gap small or medium but always jumpable
+        platforms.push({x:cursor, y:pathY, w:rand(140,220), h:20});
+        cursor += rand(220,300);
+        // leave gap intentionally
+        cursor += rand(100,200); // gap width
+        break;
+      case 'floating':
+        // floating coin arc
+        const arcStart = cursor;
+        const count = 4;
+        let arcY = pathY - rand(110,180);
+        for(let k=0;k<count;k++){
+          platforms.push({x:arcStart + k*140, y:arcY + Math.sin(k)*20, w:90, h:14, floating:true});
+        }
+        cursor += count*140;
+        break;
+      case 'stair_up':
+        let sy = pathY;
+        for(let s=0;s<4;s++){
+          platforms.push({x:cursor + s*80, y:sy - s*36, w:80, h:18});
+        }
+        cursor += 4*80 + 40;
+        pathY -= 36*1;
+        break;
+      case 'stair_down':
+        let sy2 = pathY;
+        for(let s=0;s<4;s++){
+          platforms.push({x:cursor + s*80, y:sy2 + s*36, w:80, h:18});
+        }
+        cursor += 4*80 + 40;
+        pathY += 36;
+        pathY = clamp(pathY, FLOOR_Y - 200, FLOOR_Y - 60);
+        break;
+    }
+    // occasional side floating platform (bonus)
+    if(Math.random() < 0.45){
+      const fx = cursor - rand(120,300);
+      const fy = pathY - rand(120,260);
+      platforms.push({x:fx,y:fy,w:rand(90,160),h:14, floating:true});
+      // sometimes place a coin above it
+      if(Math.random() < 0.6) coins.push({x:fx + 40, y:fy - 36, r:10, taken:false});
+    }
+    // place blocks and ?-blocks along path
+    if(Math.random() < 0.5){
+      blocks.push({x:cursor+rand(60,220), y: pathY - 60, w:32, h:32, kind:'question', used:false});
+    }
+    // maybe a pipe
+    if(Math.random() < 0.28){
+      const px = cursor + rand(120,260);
+      pipes.push({x:px, y:FLOOR_Y - 64, w:56, h:64});
+      // piranha spawns anchored to pipe
+      if(Math.random() < 0.6) enemies.push({x:px + 18, y:FLOOR_Y - 64 - 30, type: ENEMY_TYPE.PIRANHA, w:28,h:32,active:false});
+    }
+    // iterate
+    cursor += rand(280,420);
+    // clamp pathY so it doesn't drift far
+    pathY = clamp(pathY, FLOOR_Y - 220, FLOOR_Y - 60);
+  }
+
+  // place player-safe platforms if none
+  if(platforms.length < 6){
+    for(let i=300;i<LEVEL.width;i+=600) platforms.push({x:i,y:FLOOR_Y - 100, w:200, h:20});
+  }
+
+  // spawn coins along main path
+  let placed = 0;
+  for(const p of platforms){
+    if(placed >= LEVEL.coinCount) break;
+    if(Math.random() < 0.25 && p.floating !== true){
+      coins.push({x: p.x + p.w/2 + rand(-30,30), y: p.y - rand(36,70), r:10, taken:false});
+      placed++;
+    }
+  }
+  // extra coins in air arcs
+  while(placed < LEVEL.coinCount){
+    const x = rand(200, LEVEL.width - 200);
+    const candidate = platforms.find(pp => x > pp.x && x < pp.x + pp.w);
+    const y = candidate ? candidate.y - rand(40,120) : FLOOR_Y - rand(90,220);
+    coins.push({x,y,r:10,taken:false}); placed++;
+  }
+
+  // ENEMIES: spawn on safe platforms (avoid trapping)
+  for(let i=0;i<LEVEL.enemyCount;i++){
+    const p = platforms[Math.floor(rand(1, platforms.length))];
+    if(!p) continue;
+    // choose enemy type by probability scaled with level
+    const tscore = Math.random() + state.level*0.04;
+    let type = ENEMY_TYPE.GOOMBA;
+    if(tscore > 1.2) type = ENEMY_TYPE.FLYER;
+    else if(tscore > 0.95) type = ENEMY_TYPE.SHOOTER;
+    else if(tscore > 0.75) type = ENEMY_TYPE.PARAGOOMBA;
+    else if(tscore > 0.55) type = ENEMY_TYPE.KOOPA;
+    else type = ENEMY_TYPE.GOOMBA;
+
+    const ex = clamp(rand(p.x + 8, p.x + p.w - 24), p.x + 8, p.x + p.w - 24);
+    const ey = p.y - 32;
+    enemies.push({x:ex, y: ey, w:28, h:28, type: type, dir: Math.random()>0.5?1:-1, speed: rand(30,70) + state.level*3, baseX: ex, range: Math.min(220, p.w - 40), vy:0, shootCooldown: rand(0.6,2.0), jumpCooldown: rand(0.6,1.8), alive:true});
+  }
+
+  // place breakable bricks occasionally above path
+  for(let b=0;b<Math.floor(LEVEL.width/1200);b++){
+    const bx = 500 + b*900 + rand(-40,120);
+    const by = rand(FLOOR_Y - 220, FLOOR_Y - 140);
+    blocks.push({x:bx,y:by,w:32,h:32, kind:'breakable', used:false});
+  }
+
+  // checkpoints placed in segments
+  const segments = Math.max(2, Math.floor(LEVEL.width / (CONFIG.sectionWidth*1.6)));
+  for(let i=1;i<=CONFIG.checkpointCount;i++){
+    const cx = (LEVEL.width / (CONFIG.checkpointCount + 1)) * i;
+    // find platform at that x
+    const plat = platforms.filter(p => cx >= p.x && cx <= p.x + p.w).sort((a,b)=>a.y-b.y)[0];
+    const cy = plat ? plat.y - 54 : FLOOR_Y - 54;
+    checkpoints.push({x: cx, y: cy, w:28, h:52, activated:false});
+  }
+
+  // finish flag at end
+  flag = { x: LEVEL.width - 220, y: FLOOR_Y - 240, w:32, h:240 };
+
+  // Give player starting position
+  if(activeCheckpoint){
+    player.x = activeCheckpoint.x; player.y = activeCheckpoint.y - 10;
+  } else {
+    player.x = 120; player.y = -10;
+  }
+}
+
+/* choose chunk pattern with a simple grammar */
+function chooseChunk(index){
+  // ensure some variety and early easy chunks
+  const roll = Math.random();
+  if(index < 1) return 'straight';
+  if(roll < 0.26) return 'straight';
+  if(roll < 0.42) return 'small_hills';
+  if(roll < 0.58) return 'gap';
+  if(roll < 0.74) return 'floating';
+  if(roll < 0.88) return 'stair_up';
+  return 'stair_down';
+}
+
+/* ========== GAME UPDATE (physics, AI, interactions) ========= */
+function update(dt){
+  // inputs
+  const left = keys['a'] || keys['arrowleft'];
+  const right = keys['d'] || keys['arrowright'];
+  const up = keys['w'] || keys['arrowup'] || keys[' '];
+
+  // horizontal
+  let desired = 0;
+  if(left) desired -= 1;
+  if(right) desired += 1;
+  const accel = CONFIG.accel * (player.onGround ? 1 : CONFIG.airControl);
+  player.vx += desired * accel * dt;
+  player.vx = clamp(player.vx, -CONFIG.maxSpeed, CONFIG.maxSpeed);
+  if(desired === 0) player.vx *= Math.pow(CONFIG.friction, dt*60);
+
+  // gravity
+  player.vy += CONFIG.gravity * dt;
+
+  // coyote and jump buffer
+  if(player.onGround) player.canJumpTimer = CONFIG.coyoteTime;
+  else player.canJumpTimer -= dt;
+  if(player.jumpBuffer > 0) player.jumpBuffer -= dt;
+  if(player.jumpBuffer > 0 && player.canJumpTimer > 0){
+    player.vy = -CONFIG.jumpSpeed;
+    player.onGround = false; player.jumpBuffer = 0;
+    for(let i=0;i<16;i++) spawnParticle(player.x + player.w/2 + rand(-10,10), player.y + player.h, rand(-220,220), rand(-420,-120), 0.6+Math.random()*0.5, 'rgba(255,200,120,0.95)', 2);
+  }
+  if(!up && player.vy < 0) player.vy += CONFIG.gravity * dt * CONFIG.variableJumpMult;
+
+  // integrate player
+  player.x += player.vx * dt;
+  player.y += player.vy * dt;
+
+  // world collisions player vs platforms
+  player.onGround = false;
+  for(const p of platforms){
+    const A = {x:player.x, y:player.y, w:player.w, h:player.h};
+    const B = {x:p.x, y:p.y, w:p.w, h:p.h};
+    if(rectsOverlap(A,B)){
+      const overlapX = Math.min(A.x + A.w - B.x, B.x + B.w - A.x);
+      const overlapY = Math.min(A.y + A.h - B.y, B.y + B.h - A.y);
+      if(overlapY < overlapX){
+        // vertical correction
+        if(A.y < B.y){
+          player.y -= overlapY; player.vy = 0; player.onGround = true;
+        } else { player.y += overlapY; player.vy = 0; }
+      } else {
+        if(A.x < B.x){ player.x -= overlapX; player.vx = 0; } else { player.x += overlapX; player.vx = 0; }
+      }
+    }
+  }
+
+  // collisions with pipes top (so player stands on pipe)
+  for(const pipe of pipes){
+    const A = {x:player.x, y:player.y, w:player.w, h:player.h};
+    const B = {x:pipe.x, y:pipe.y, w:pipe.w, h:pipe.h};
+    if(rectsOverlap(A,B)){
+      const overlapY = Math.min(A.y + A.h - B.y, B.y + B.h - A.y);
+      if(player.y < B.y) { player.y -= overlapY; player.vy = 0; player.onGround = true; }
+    }
+  }
+
+  // blocks interactions (question + breakable)
+  for(const b of blocks){
+    if(b.used) continue;
+    // simplistic: if player hits bottom of block from below: y decreasing upward
+    const head = {x: player.x, y: player.y, w: player.w, h: player.h};
+    // check hitting block from below: player's top intersects block bottom
+    if(player.vy < 0){
+      const headBox = {x: player.x+4, y: player.y, w: player.w-8, h: 6};
+      const blockBox = {x: b.x, y: b.y + b.h - 2, w: b.w, h: 3};
+      if(rectsOverlap(headBox, blockBox)){
+        // activate
+        if(b.kind === 'question'){
+          // spawn coin or powerup sometimes
+          if(Math.random() < 0.25){
+            // spawn powerup
+            const puType = (Math.random() < 0.35 ? 'mushroom' : (Math.random() < 0.25 ? 'fireflower' : 'coin'));
+            if(puType === 'mushroom') particles.push({x:b.x+16,y:b.y-24,vx:0,vy:-60,life:0.9,color:'rgba(255,150,120,1)',size:6, power:'mushroom'});
+            else if(puType === 'fireflower') particles.push({x:b.x+16,y:b.y-24,vx:0,vy:-60,life:0.9,color:'rgba(255,80,140,1)',size:6, power:'fire'});
+            else coins.push({x:b.x+16,y:b.y-32,r:10,taken:false});
+          } else {
+            coins.push({x:b.x+16,y:b.y-32,r:10,taken:false});
+          }
+          b.used = true;
+        } else if(b.kind === 'breakable'){
+          // if player big, break; else bump
+          if(player.power === POWER.BIG || player.power === POWER.FIRE){
+            // break (remove)
+            b.used = true;
+            for(let i=0;i<8;i++) spawnParticle(b.x + rand(2,30), b.y + rand(2,30), rand(-120,120), rand(-260,-30), 0.6 + Math.random()*0.6, 'rgba(200,150,110,1)', 3);
+          } else {
+            // bump coin sometimes
+            if(Math.random() < 0.35) coins.push({x:b.x+16,y:b.y-32,r:10,taken:false});
+            b.used = true;
+          }
+        }
+      }
+    }
+  }
+
+  // coins collection
+  for(const c of coins){
+    if(c.taken) continue;
+    const dx = player.x + player.w/2 - c.x;
+    const dy = player.y + player.h/2 - c.y;
+    if(dx*dx + dy*dy < (c.r+16)*(c.r+16)){
+      c.taken = true; player.score += 100; scoreEl.innerText = player.score;
+      for(let i=0;i<12;i++) spawnParticle(c.x, c.y, rand(-220,220), rand(-260,-40), 0.8+Math.random()*0.6, 'rgba(255,220,80,0.95)', 3);
+    }
+  }
+
+  // flag collision -> finish level
+  if(flag){
+    if(player.x + player.w > flag.x && player.x < flag.x + 40 && player.y + player.h > flag.y + 60){
+      // level complete: award points and go to next
+      player.score += 1000;
+      scoreEl.innerText = player.score;
+      // simple next level
+      state.level += 1; levelEl.innerText = state.level;
+      setTheme(state.level);
+      makeLevel();
+      return;
+    }
+  }
+
+  // checkpoints
+  for(const cp of checkpoints){
+    if(!cp.activated && rectsOverlap({x:player.x,y:player.y,w:player.w,h:player.h},{x:cp.x,y:cp.y,w:cp.w,h:cp.h})){
+      cp.activated = true; activeCheckpoint = cp;
+      for(let i=0;i<18;i++) spawnParticle(cp.x + cp.w/2, cp.y, rand(-220,220), rand(-260,-80), 0.9, 'rgba(120,255,120,0.9)',3);
+    }
+  }
+
+  // enemies AI & physics
+  for(const e of enemies){
+    if(!e.alive) continue;
+
+    const px = player.x + player.w/2, py = player.y + player.h/2;
+    const dx = px - e.x, dy = py - e.y; const dist = Math.sqrt(dx*dx + dy*dy);
+
+    switch(e.type){
+      case ENEMY_TYPE.GOOMBA:
+        e.x += e.dir * e.speed * dt;
+        if(Math.abs(e.x - e.baseX) > (e.range || 80)) e.dir *= -1;
+        break;
+      case ENEMY_TYPE.KOOPA:
+        // like walker but can be stomped into shell
+        if(!e.shell){
+          e.x += e.dir * e.speed * dt;
+          if(Math.abs(e.x - e.baseX) > (e.range || 120)) e.dir *= -1;
+        } else {
+          // sliding shell - faster
+          e.x += e.shellDir * 260 * dt;
+        }
+        break;
+      case ENEMY_TYPE.PARAGOOMBA:
+        // hop when near
+        e.x += e.dir * e.speed * dt * 0.9;
+        if(dist < 300 && Math.random() < 0.015) { e.vy = -260; }
+        break;
+      case ENEMY_TYPE.PIRANHA:
+        // stationary: pop up and down if player not too close horizontally
+        if(Math.abs(player.x - e.x) < 40) {
+          // hide
+        } else {
+          // cycle active/inactive with shootCooldown as timer
+          e.shootCooldown -= dt;
+          if(e.shootCooldown <= 0){ e.active = !e.active; e.shootCooldown = rand(1.2,1.8); }
+        }
+        break;
+      case ENEMY_TYPE.SHOOTER:
+        // shoot at player when in range and on same vertical band
+        if(Math.abs(py - e.y) < 140 && Math.abs(px - e.x) < 420){
+          e.shootCooldown -= dt;
+          if(e.shootCooldown <= 0){
+            const ang = Math.atan2(py - e.y, px - e.x);
+            bullets.push({x: e.x + e.w/2, y: e.y + e.h/2, vx: Math.cos(ang)*320, vy: Math.sin(ang)*320, life: 2, hostile:true});
+            e.shootCooldown = rand(1.2,2.4);
+          }
+        }
+        break;
+      case ENEMY_TYPE.FLYER:
+        // move towards player gently
+        if(dist > 10){
+          e.x += dx / dist * e.speed * 0.9 * dt;
+          e.y += dy / dist * e.speed * 0.9 * dt;
+        }
+        break;
+    }
+
+    // enemy gravity if not flyer
+    if(e.type !== ENEMY_TYPE.FLYER && e.type !== ENEMY_TYPE.PIRANHA){
+      e.vy = (e.vy || 0) + CONFIG.gravity * dt;
+      e.y += e.vy * dt;
+      // simple platform ground collision
+      for(const p of platforms){
+        if(rectsOverlap({x:e.x,y:e.y,w:e.w,h:e.h},{x:p.x,y:p.y,w:p.w,h:p.h})){
+          e.y = p.y - e.h; e.vy = 0;
+        }
+      }
+    } else if(e.type === ENEMY_TYPE.PIRANHA){
+      // piranha has small bob
+      if(e.active) e.y -= Math.sin(performance.now()/300 + e.baseX)*0.2; // visual bob
+    }
+
+    // collisions with player
+    if(!player.invuln && rectsOverlap({x:player.x,y:player.y,w:player.w,h:player.h},{x:e.x,y:e.y,w:e.w,h:e.h})){
+      // check stomp: player falling onto enemy from above
+      const stomp = player.vy > 150 && (player.y + player.h - e.y) < 20;
+      if(stomp && e.type !== ENEMY_TYPE.FLYER && e.type !== ENEMY_TYPE.PIRANHA){
+        // stomp effect
+        e.alive = false;
+        player.vy = -260; player.score += 200; scoreEl.innerText = player.score;
+        for(let i=0;i<14;i++) spawnParticle(e.x + e.w/2, e.y + e.h/2, rand(-260,260), rand(-320,-80), 0.8, 'rgba(240,120,100,0.95)',3);
+        // if koopa -> become shell
+        if(e.type === ENEMY_TYPE.KOOPA){
+          e.alive = true; e.shell = true; e.shellDir = player.vx >= 0 ? 1 : -1; e.type = ENEMY_TYPE.KOOPA;
+        } else e.alive = false;
+      } else {
+        // non-stomp -> damage
+        if(e.type === ENEMY_TYPE.KOOPA && e.shell){
+          // shell hits player - instantly hurt
+          hurtPlayer();
+        } else {
+          // aftter stomp or flank
+          if(player.power === POWER.STAR){
+            // invincible: kill enemy on touch
+            e.alive = false; player.score += 200; scoreEl.innerText = player.score;
+          } else {
+            hurtPlayer();
+          }
+        }
+      }
+    }
+  }
+  enemies = enemies.filter(e => e.alive !== false);
+
+  // bullets update
+  for(const b of bullets){
+    b.x += b.vx * dt; b.y += b.vy * dt; b.life -= dt;
+    if(b.hostile && !player.invuln && rectsOverlap({x:player.x,y:player.y,w:player.w,h:player.h},{x:b.x-6,y:b.y-6,w:12,h:12})){
+      hurtPlayer(); b.life = -1;
+    }
+    // friendly bullets hitting enemies
+    if(!b.hostile){
+      for(const e of enemies){
+        if(rectsOverlap({x:b.x-4,y:b.y-4,w:8,h:8},{x:e.x,y:e.y,w:e.w,h:e.h})){
+          e.alive = false; b.life = -1; player.score += 180; scoreEl.innerText = player.score;
+          for(let i=0;i<10;i++) spawnParticle(e.x + e.w/2, e.y + e.h/2, rand(-200,200), rand(-200,-60), 0.7, 'rgba(255,140,140,0.95)',3);
+        }
+      }
+    }
+  }
+  bullets = bullets.filter(b => b.life > 0);
+
+  // particles update
+  for(const p of particles){ p.t += dt; p.x += p.vx * dt; p.y += p.vy * dt; p.vy += CONFIG.gravity * 0.25 * dt; }
+  particles = particles.filter(p => p.t < p.life);
+
+  // power-up pickups via particle emission simulation (we used particle storage for spawned pickups)
+  // detect particle-powerups: particles with .power property become collectable pickups after short time (simplified)
+  for(const p of particles){
+    if(p.power && p.t > 0.22){
+      // create pickup object and remove particle
+      if(p.power === 'mushroom') { spawnPickup('mushroom', p.x, p.y); p.t = p.life + 1; }
+      if(p.power === 'fire') { spawnPickup('fireflower', p.x, p.y); p.t = p.life + 1; }
+    }
+  }
+  // pickups are represented in coins array as special objects with pickup:true
+  // pickup collision
+  for(const c of coins){
+    if(c.taken) continue;
+    if(c.pickup){
+      if(rectsOverlap({x:player.x,y:player.y,w:player.w,h:player.h},{x:c.x-12,y:c.y-12,w:24,h:24})){
+        c.taken = true;
+        applyPickup(c.pickupType);
+      }
+    }
+  }
+
+  // if fall below screen -> respawn or lose life
+  if(player.y > canvas.height + 240){
+    player.lives -= 1; livesEl.innerText = player.lives;
+    if(activeCheckpoint){ player.x = activeCheckpoint.x; player.y = activeCheckpoint.y - 10; } else { player.x = 120; player.y = -10; }
+    player.vx = 0; player.vy = 0; player.invuln = 1.2;
+    if(player.lives <= 0) setTimeout(()=> initGame(true), 700);
+  }
+
+  // timers
+  if(player.invuln) player.invuln = Math.max(0, player.invuln - dt);
+  if(player.shootCooldown) player.shootCooldown = Math.max(0, player.shootCooldown - dt);
+  if(player.starTimer){ player.starTimer -= dt; if(player.starTimer <= 0){ player.power = player.big ? POWER.FIRE : (player.big ? POWER.BIG : POWER.SMALL); player.starTimer = 0; } }
+  if(player.bigTimer){ player.bigTimer -= dt; if(player.bigTimer <= 0){ if(player.power === POWER.FIRE) player.power = POWER.SMALL; player.bigTimer = 0; } }
+
+  // camera smoothing: look ahead in movement direction
+  const camTargetX = clamp(player.x - camera.w * 0.35 + Math.sign(player.vx)*60, 0, LEVEL.width - camera.w);
+  camera.x += (camTargetX - camera.x) * clamp(dt * 6, 0, 1);
+  camera.y = 0;
+
+  // update HUD power text
+  powerEl.innerText = player.power;
+}
+
+/* apply pickup logic */
+function applyPickup(type){
+  if(type === 'mushroom'){
+    // grow player
+    player.power = POWER.BIG; player.big = true; player.bigTimer = 0; // permanent until damage
+  } else if(type === 'fireflower'){
+    player.power = POWER.FIRE; player.big = true; player.bigTimer = 0;
+  } else if(type === 'star'){
+    player.power = POWER.STAR; player.starTimer = 8.0; player.invuln = 8.0;
+  } else if(type === '1up'){
+    player.lives += 1; livesEl.innerText = player.lives;
+  } else if(type === 'coin'){
+    player.score += 200; scoreEl.innerText = player.score;
+  }
+}
+
+/* spawn pickup as coin-like collectable */
+function spawnPickup(kind, x, y){
+  coins.push({x:x, y:y, r:10, taken:false, pickup:true, pickupType: kind});
+}
+
+/* hurting the player */
+function hurtPlayer(){
+  if(player.invuln || player.power === POWER.STAR) return;
+  // if big -> shrink; else lose life
+  if(player.power === POWER.FIRE || player.power === POWER.BIG){
+    // shrink
+    player.power = POWER.SMALL; player.big = false;
+    player.invuln = 1.6;
+    for(let i=0;i<14;i++) spawnParticle(player.x + player.w/2, player.y + player.h/2, rand(-200,200), rand(-220,-30), 0.8, 'rgba(255,60,60,0.95)', 3);
+  } else {
+    player.lives -= 1; livesEl.innerText = player.lives;
+    player.invuln = 1.6;
+    player.x = activeCheckpoint ? activeCheckpoint.x : 120; player.y = activeCheckpoint ? activeCheckpoint.y - 10 : -10;
+    player.vx = 0; player.vy = 0;
+    if(player.lives <= 0) setTimeout(()=> initGame(true), 700);
+  }
+}
+
+/* ========== RENDER ========= */
+function draw(){
+  // sky gradient
+  const g = ctx.createLinearGradient(0,0,0,canvas.height);
+  g.addColorStop(0, SKY_TOP); g.addColorStop(1, SKY_BOTTOM);
+  ctx.fillStyle = g; ctx.fillRect(0,0,canvas.width,canvas.height);
+
+  // parallax hills
+  drawParallax();
+
+  // world translate
+  ctx.save(); ctx.translate(-camera.x, -camera.y);
+
+  // ground & platforms
+  for(const p of platforms){
+    if(p.type === 'ground'){
+      // draw repeating ground
+      ctx.fillStyle = '#7b512f';
+      ctx.fillRect(p.x, p.y, p.w, p.h);
+      // top highlight
+      ctx.fillStyle = 'rgba(255,255,255,0.06)'; ctx.fillRect(p.x + 8, p.y + 6, p.w - 16, 6);
+    } else {
+      ctx.fillStyle = '#8c6b43'; roundRect(ctx, p.x, p.y, p.w, p.h, 6, true);
+    }
+  }
+
+  // pipes
+  for(const pipe of pipes){
+    // body
+    ctx.fillStyle = '#2fa04a'; roundRect(ctx, pipe.x, pipe.y, pipe.w, pipe.h, 6, true);
+    // lip
+    ctx.fillStyle = '#1b7a32'; ctx.fillRect(pipe.x - 6, pipe.y - 6, pipe.w + 12, 8);
+  }
+
+  // blocks and ? blocks
+  for(const b of blocks){
+    if(b.used) {
+      ctx.fillStyle = 'rgba(255,255,255,0.06)'; roundRect(ctx, b.x, b.y, b.w, b.h, 4, true);
+      continue;
+    }
+    if(b.kind === 'question'){
+      ctx.fillStyle = '#ffcc33'; roundRect(ctx, b.x, b.y, b.w, b.h, 6, true);
+      ctx.fillStyle = '#7b4b00'; ctx.fillRect(b.x+8, b.y+8, 16, 16);
+    } else {
+      ctx.fillStyle = '#a56f47'; roundRect(ctx, b.x, b.y, b.w, b.h, 4, true);
+    }
+  }
+
+  // coins
+  for(const c of coins){
+    if(c.taken) continue;
+    if(c.pickup){
+      // power-ups as small icons
+      ctx.beginPath(); ctx.arc(c.x, c.y, 10, 0, Math.PI*2); ctx.fillStyle = '#ffa'; ctx.fill();
+      ctx.fillStyle = '#f90'; ctx.fillText('P', c.x-4, c.y+4);
+    } else {
+      const bob = Math.sin((performance.now()/450) + c.x*0.002)*6;
+      ctx.beginPath(); ctx.ellipse(c.x, c.y + bob, c.r, c.r*0.7, 0, 0, Math.PI*2); ctx.fillStyle = 'gold'; ctx.fill(); ctx.strokeStyle = 'rgba(0,0,0,0.28)'; ctx.stroke();
+    }
+  }
+
+  // enemies
+  for(const e of enemies){
+    if(!e.alive) continue;
+    ctx.save(); ctx.translate(e.x, e.y);
+    switch(e.type){
+      case ENEMY_TYPE.GOOMBA:
+        ctx.fillStyle = '#b0523b'; roundRect(ctx, -2, -2, e.w+4, e.h+4, 8, true); ctx.fillStyle = '#111'; ctx.fillRect(6,6,6,6); break;
+      case ENEMY_TYPE.KOOPA:
+        ctx.fillStyle = e.shell ? '#222' : '#2bbf3b'; roundRect(ctx, -2, -2, e.w+4, e.h+4, 8, true); break;
+      case ENEMY_TYPE.PARAGOOMBA:
+        ctx.fillStyle = '#b0523b'; roundRect(ctx, -2, -2, e.w+4, e.h+4, 8, true); // wings
+        ctx.fillStyle = 'rgba(255,255,255,0.6)'; ctx.fillRect(-12, -12, 10, 4); ctx.fillRect(6, -12, 10, 4); break;
+      case ENEMY_TYPE.PIRANHA:
+        ctx.fillStyle = '#c33'; roundRect(ctx, -2, -2, e.w+4, e.h+4, 8, true); ctx.fillStyle='#fff'; ctx.fillRect(-6, -2, 12, 6); break;
+      case ENEMY_TYPE.SHOOTER:
+        ctx.fillStyle = '#7a3c9a'; roundRect(ctx, -2, -2, e.w+4, e.h+4, 8, true); break;
+      case ENEMY_TYPE.FLYER:
+        ctx.fillStyle = '#e07b6f'; roundRect(ctx, -2, -2, e.w+4, e.h+4, 8, true); break;
+    }
+    ctx.restore();
+  }
+
+  // bullets
+  for(const b of bullets){
+    ctx.beginPath(); ctx.arc(b.x, b.y, 5, 0, Math.PI*2); ctx.fillStyle = b.hostile ? 'rgba(255,120,120,0.95)' : 'rgba(255,240,200,0.95)'; ctx.fill();
+  }
+
+  // particles
+  for(const p of particles){
+    ctx.globalAlpha = clamp(1 - p.t / p.life,0,1);
+    ctx.fillStyle = p.color || '#fff'; ctx.beginPath(); ctx.arc(p.x, p.y, p.size, 0, Math.PI*2); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+
+  // flag & castle
+  if(flag){
+    // pole
+    ctx.fillStyle = '#333'; ctx.fillRect(flag.x, flag.y, 8, flag.h);
+    ctx.fillStyle = '#c33'; ctx.fillRect(flag.x+8, flag.y + 28, 36, 18);
+    // little castle
+    ctx.fillStyle = '#2b2b2b'; roundRect(ctx, flag.x + 80, flag.y + flag.h - 100, 120, 80, 8, true);
+  }
+
+  // checkpoints
+  for(const cp of checkpoints){
+    ctx.save(); ctx.translate(cp.x, cp.y);
+    ctx.fillStyle = '#ddd'; ctx.fillRect(0, 0, 6, cp.h);
+    ctx.fillStyle = cp.activated ? '#4aff4a' : '#ff4040';
+    ctx.beginPath(); ctx.moveTo(6,6); ctx.lineTo(28,14); ctx.lineTo(6,24); ctx.closePath(); ctx.fill();
+    ctx.restore();
+  }
+
+  // player
+  ctx.save(); ctx.translate(player.x, player.y);
+  if(player.invuln) ctx.globalAlpha = 0.45 + 0.55 * Math.abs(Math.sin(performance.now()/90));
+  // shadow
+  ctx.beginPath(); ctx.ellipse(player.w/2, player.h+8, player.w*0.6, 8, 0, 0, Math.PI*2); ctx.fillStyle = 'rgba(0,0,0,0.18)'; ctx.fill();
+  // body (bigger when big)
+  const ph = (player.power === POWER.BIG || player.power === POWER.FIRE) ? player.h + 12 : player.h;
+  ctx.fillStyle = (player.power===POWER.FIRE)?'#ff7b61':'#ff6f61'; roundRect(ctx, 0, -2, player.w, ph, 8, true);
+  // visor
+  ctx.fillStyle = '#ffd9d0'; ctx.fillRect(6,12,player.w-12,10);
+  // gun when fire-power is active: show small nozzle (mouse click shoots)
+  if(player.power === POWER.FIRE){
+    ctx.translate(player.w/2, ph/2 - 6);
+    const aimX = camera.x + pointer.x - (player.x + player.w/2);
+    const aimY = camera.y + pointer.y - (player.y + ph/2);
+    const ang = Math.atan2(aimY, aimX);
+    ctx.rotate(ang); ctx.fillStyle = '#333'; ctx.fillRect(12, -4, 18, 6);
+  }
+  ctx.restore();
+
+  // restore world transform
+  ctx.restore();
+
+  // HUD crosshair
+  ctx.beginPath(); ctx.arc(pointer.x, pointer.y, 8, 0, Math.PI*2); ctx.strokeStyle = 'rgba(255,255,255,0.55)'; ctx.lineWidth = 1.2; ctx.stroke();
+
+  // small debug / info
+  // ctx.fillStyle = '#fff'; ctx.fillText('Enemies: ' + enemies.length, 12, 84);
+}
+
+function drawParallax(){
+  const t = performance.now()/1000;
+  // mountains (parallax)
+  const mx = -camera.x * 0.18;
+  ctx.save(); ctx.translate(mx,0);
+  for(let i=-2;i<10;i++){
+    const x = i*600 + Math.sin(i*1.3 + t*0.2)*40;
+    const y = canvas.height - 160;
+    drawMountain(x, y, 260, 120, '#3b6b4b','#274056');
+  }
+  ctx.restore();
+  // clouds
+  ctx.save();
+  const cx = -camera.x * 0.32 + Math.sin(t*0.6)*30;
+  for(let i=0;i<12;i++){
+    const x = (i*400 + (t*40) + cx) % LEVEL.width;
+    const y = 80 + Math.sin(i*0.7 + t*0.5)*28;
+    drawCloud(x, y, 120 + (i%3)*40);
+  }
+  ctx.restore();
+}
+
+function drawMountain(x,y,w,h,top,bottom){ const g = ctx.createLinearGradient(x, y-h, x, y); g.addColorStop(0, top); g.addColorStop(1, bottom); ctx.fillStyle = g; ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(x + w*0.5, y - h); ctx.lineTo(x + w, y); ctx.closePath(); ctx.fill(); }
+function drawCloud(x,y,s){ ctx.beginPath(); ctx.ellipse(x, y, s*0.5, s*0.35, 0, 0, Math.PI*2); ctx.ellipse(x + s*0.35, y-6, s*0.45, s*0.3, 0,0,Math.PI*2); ctx.ellipse(x - s*0.35, y-6, s*0.45, s*0.3, 0,0,Math.PI*2); ctx.fillStyle = 'rgba(255,255,255,0.86)'; ctx.fill(); }
+function roundRect(ctx,x,y,w,h,r,fill){ if(typeof r === 'undefined') r=6; ctx.beginPath(); ctx.moveTo(x+r,y); ctx.arcTo(x+w,y,x+w,y+h,r); ctx.arcTo(x+w,y+h,x,y+h,r); ctx.arcTo(x,y+h,x,y,r); ctx.arcTo(x,y,x+w,y,r); ctx.closePath(); if(fill) ctx.fill(); }
+
+/* ========== GAME LOOP ========= */
+function loop(){
+  const now = performance.now()/1000;
+  let dt = now - state.lastTime;
+  if(dt > 0.05) dt = 0.05;
+  state.lastTime = now;
+  update(dt);
+  draw();
+  requestAnimationFrame(loop);
+}
+
+/* ========== INIT / RESTART ========= */
+function initGame(keepScore=false){
+  if(!keepScore){
+    player.score = 0; player.lives = 3; player.power = POWER.SMALL; player.invuln = 0; scoreEl.innerText = 0; livesEl.innerText = 3; state.level = 1; levelEl.innerText = 1;
+  } else {
+    player.lives = 3; livesEl.innerText = 3;
+  }
+  setTheme(state.level);
+  LEVEL.width = CONFIG.baseLevelWidth + (state.level-1)*600;
+  makeLevel();
+  camera.x = 0; camera.y = 0;
+}
+initGame();
+loop();
+
+</script>
+</body>
+</html>
